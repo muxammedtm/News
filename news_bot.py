@@ -19,7 +19,13 @@ import json
 import time
 import html
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 import requests
 import feedparser
@@ -32,7 +38,7 @@ from anthropic import Anthropic
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip().strip('"').strip("'").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "").strip()   # @kanal ёки -100... ID
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001").strip()
@@ -41,8 +47,24 @@ DELAY_BETWEEN_POSTS = int(os.getenv("DELAY_BETWEEN_POSTS", "60"))  # сония
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "24"))
 # Ҳар пост тагидаги обуна чақириғи (ихтиёрий)
 CHANNEL_SIGNATURE = os.getenv("CHANNEL_SIGNATURE", "").strip()
+# Ишлаш режими: "loop" = доимий ишлайди (bothost учун), "once" = бир марта (cron учун)
+RUN_MODE = os.getenv("RUN_MODE", "loop").strip().lower()
+# Кунига нечанчи соатларда пост қилсин (вергул билан): масалан "9" ёки "9,15,20"
+POST_HOURS = [int(h) for h in os.getenv("POST_HOURS", "9").split(",") if h.strip().isdigit()]
+# Вақт минтақаси (POST_HOURS шу минтақа бўйича ҳисобланади)
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent").strip()
+# Ишга тушганда дарров бир марта пост қилсинми (синов учун true, кейин ўчиринг)
+POST_ON_START = os.getenv("POST_ON_START", "false").strip().lower() in ("1", "true", "yes")
+# Admin Telegram user ID. bothost env ишламаса ҳам ишлаши учун қуйида default берилган.
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "610489050").split(",") if x.strip().isdigit()]
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+STATE_FILE = os.path.join(
+    os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__))),
+    "state.json"
+)
+
+# API хатосини ҳақиқий SKIP'дан ажратиш учун белги
+API_ERROR = object()
 
 # RSS манбалар — хоҳлаганингизча қўшинг/ўчиринг
 SOURCES = {
@@ -220,12 +242,13 @@ def select_top(items, n):
         idx = [i for i in idx if isinstance(i, int) and 0 <= i < len(items)]
         return idx[:n]
     except Exception as e:
-        log.warning("Танлов хатоси, биринчи %d та олинди: %s", n, e)
-        return list(range(min(n, len(items))))
+        log.warning("Танлов хатоси: %s", e)
+        return None   # API хатоси — ишни тўхтатиш сигнали
 
 
 def rewrite(item):
-    """Битта янгиликни тайёр Telegram постга айлантиради. SKIP бўлса None."""
+    """Битта янгиликни тайёр Telegram постга айлантиради.
+    Қайтаради: матн (муваффақият) | None (ҳақиқий SKIP) | API_ERROR (API хатоси)."""
     user_content = (
         f"Манба номи: {item['source']}\n"
         f"Ҳавола: {item['link']}\n"
@@ -245,7 +268,7 @@ def rewrite(item):
         return text
     except Exception as e:
         log.warning("Қайта ёзиш хатоси: %s", e)
-        return None
+        return API_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -297,15 +320,21 @@ def main():
         return
 
     top_idx = select_top(candidates, POSTS_PER_DAY)
+    if top_idx is None:
+        log.error("⛔ Claude API'га уланиб бўлмади (калит ёки баланс?). Иш тўхтатилди.")
+        return
     log.info("Танланди: %d та", len(top_idx))
 
     published_count = 0
     for i in top_idx:
         item = candidates[i]
         post_text = rewrite(item)
+        if post_text is API_ERROR:
+            log.error("⛔ Claude API хатоси — иш тўхтатилди. Ҳеч нима нотўғри белгиланмади.")
+            break                              # postedга қўшмаймиз!
         if not post_text:
             log.info("SKIP: %s", item["title"][:60])
-            posted.add(item["link"])      # қайта урунмаслик учун
+            posted.add(item["link"])           # ҳақиқий SKIP — қайта урунмаймиз
             continue
 
         image = item["image"] or get_og_image(item["link"])
@@ -322,5 +351,172 @@ def main():
     log.info("Тугади. Жами жойланган: %d та", published_count)
 
 
+def publish_one():
+    """Биттагина янги пост чиқаради. Admin /post буйруғи учун."""
+    posted = load_state()
+    candidates = [it for it in fetch_candidates() if it["link"] not in posted]
+    if not candidates:
+        return "⚠️ Ҳозирча янги янгилик йўқ."
+    # Энг биринчисини олиб, Claude орқали ёзамиз
+    for item in candidates[:5]:
+        post_text = rewrite(item)
+        if post_text is API_ERROR:
+            return "⛔ Claude API хатоси. Калитни текширинг."
+        if not post_text:
+            posted.add(item["link"])
+            continue
+        image = item["image"] or get_og_image(item["link"])
+        if post_to_telegram(post_text, image):
+            posted.add(item["link"])
+            save_state(posted)
+            log.info("✓ Admin буйруғи билан жойланди: %s", item["title"][:60])
+            return "✅ Пост каналга жойланди!"
+        else:
+            return "⛔ Telegram'га юбориб бўлмади. Бот каналда adminми?"
+    return "⚠️ Янгиликлар топилди, лекин барчаси SKIP қилинди."
+
+
+def send_msg(chat_id, text):
+    """Adminга хабар юборади."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": chat_id, "text": text},
+            timeout=15,
+        )
+    except Exception as e:
+        log.warning("Admin'га хабар юбориб бўлмади: %s", e)
+
+
+# Глобал lock — бир вақтда 2 та пост жараёни ишламасин
+_post_lock = threading.Lock()
+
+
+def admin_polling():
+    """Telegram long-polling орқали admin буйруқларини тинглайди.
+    Қўллаб-қувватланадиган буйруқлар:
+      /post  — каналга 1 та янги пост жойлаш
+      /status — бот ҳолати
+    """
+    if not ADMIN_IDS:
+        log.info("ADMIN_IDS бўш — admin polling ишламайди.")
+        return
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    offset = None
+    log.info("Admin polling ишга тушди (admin ID'лар: %s)", ADMIN_IDS)
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": ["message"]}
+            if offset:
+                params["offset"] = offset
+            r = requests.get(f"{api}/getUpdates", params=params, timeout=40)
+            updates = r.json().get("result", [])
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                user_id = msg.get("from", {}).get("id")
+                chat_id = msg.get("chat", {}).get("id")
+                text = msg.get("text", "").strip()
+                if user_id not in ADMIN_IDS:
+                    continue
+                if text == "/post":
+                    send_msg(chat_id, "⏳ Янгилик танланмоқда, кутинг...")
+                    if _post_lock.locked():
+                        send_msg(chat_id, "⚠️ Жараён аллақачон ишлаяпти, кутинг.")
+                        continue
+                    def _do_post(cid=chat_id):
+                        with _post_lock:
+                            result = publish_one()
+                        send_msg(cid, result)
+                    threading.Thread(target=_do_post, daemon=True).start()
+                elif text == "/status":
+                    now = _local_now()
+                    send_msg(chat_id,
+                        f"🤖 Бот ишлаяпти\n"
+                        f"🕐 Вақт: {now.strftime('%H:%M')} ({TIMEZONE})\n"
+                        f"📅 Пост соатлари: {POST_HOURS}\n"
+                        f"📰 Кунига: {POSTS_PER_DAY} та пост\n"
+                        f"💳 Модел: {CLAUDE_MODEL}"
+                    )
+                elif text == "/help":
+                    send_msg(chat_id,
+                        "📋 Admin буйруқлари:\n"
+                        "/post — каналга 1 та янги пост жойлаш\n"
+                        "/status — бот ҳолати\n"
+                        "/help — буйруқлар рўйхати"
+                    )
+        except Exception as e:
+            log.warning("Admin polling хатоси: %s", e)
+            time.sleep(5)
+
+
+def _local_now():
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo(TIMEZONE))
+        except Exception:
+            pass
+    return datetime.now()
+
+
+def start_health_server():
+    """bothost очиқ порт кутади (health-check). Бўлмаса ботни қайта ишга туширади.
+    Шунинг учун кичик HTTP сервер очамиз."""
+    port = int(os.getenv("PORT", "8080"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *args):
+            pass   # порт логларини босмаймиз
+
+    try:
+        srv = HTTPServer(("0.0.0.0", port), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info("Health-сервер ишга тушди (порт %d)", port)
+    except Exception as e:
+        log.warning("Health-сервер очилмади: %s", e)
+
+
+def run_loop():
+    """Доимий ишлаш режими (bothost учун). Белгиланган соатларда кунига бир марта пост қилади."""
+    # Эслатма: health-сервер ИШЛАТИЛМАЙДИ — bothost агенти порт 3000'ни ўзи ишлатади,
+    # акс ҳолда конфликт бўлади ("Agent недоступен"). run_loop ботни тирик ушлаб туради.
+    # Диагностика: бот ишлатаётган калитнинг бошланиши/охири/узунлиги
+    k = ANTHROPIC_API_KEY
+    if k:
+        log.info("API калит: бошланиши=%s... охири=...%s | узунлиги=%d белги",
+                 k[:14], k[-4:], len(k))
+    else:
+        log.error("API калит УМУМАН ЙЎҚ (бўш)!")
+    threading.Thread(target=admin_polling, daemon=True).start()
+    log.info("Бот ишга тушди (loop режими). Вақт минтақаси: %s | Пост соатлари: %s",
+             TIMEZONE, POST_HOURS)
+    if POST_ON_START:
+        log.info("POST_ON_START ёқилган — синов учун дарров пост қилинмоқда...")
+        try:
+            main()
+        except Exception as e:
+            log.error("main() хатоси: %s", e)
+    done_marker = None   # (сана, соат) — шу соатда пост қилинганини белгилаш
+    while True:
+        now = _local_now()
+        slot = (now.date(), now.hour)
+        if now.hour in POST_HOURS and slot != done_marker:
+            log.info("Пост вақти келди (%02d:00 %s). Бошланмоқда...", now.hour, TIMEZONE)
+            try:
+                main()
+            except Exception as e:
+                log.error("main() хатоси: %s", e)
+            done_marker = slot
+        time.sleep(60)   # ҳар дақиқада текширади
+
+
 if __name__ == "__main__":
-    main()
+    if RUN_MODE == "once":
+        main()           # cron учун: бир марта ишлаб тўхтайди
+    else:
+        run_loop()       # bothost учун: доимий ишлайди
